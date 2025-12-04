@@ -1,0 +1,681 @@
+import os
+from datetime import timezone, datetime
+from flask import Blueprint, request, send_file, current_app
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from app.extensions import db
+from app.models.order import Order
+from app.models.user import User
+from app.models.declined_order import DeclinedOrder
+from app.services.order_service import create_order, update_order_status
+from app.utils.response_formatter import success_response, error_response
+from app.utils.pagination import paginate_query
+from app.models.order_invitation import OrderInvitation
+from dateutil import parser
+from app.models.bid import Bid
+from app.services.notification_service import send_notification_to_user
+from sqlalchemy import or_, cast
+from sqlalchemy.types import String
+from app.services.order_service import (
+    save_uploaded_file,
+    calculate_minimum_price
+)
+
+bp = Blueprint("orders", __name__, url_prefix="/api/v1/orders")
+
+
+# ------------------------------------------------------------
+#  GET /orders — List orders (clients see their orders; writers see marketplace or assigned)
+# ------------------------------------------------------------
+@bp.route("", methods=["GET"])
+@jwt_required()
+def list_orders():
+    uid = get_jwt_identity()
+    user = User.query.get(uid)
+    if not user:
+        return error_response("NOT_FOUND", "User not found", status=404)
+
+    status = request.args.get("status")
+    page = request.args.get("page", 1, type=int)
+    limit = request.args.get("limit", 10, type=int)
+    search = request.args.get("search")
+
+    min_budget = request.args.get("min_budget", type=float)
+    max_budget = request.args.get("max_budget", type=float)
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+
+    assigned_to = request.args.get("assigned_to")
+
+    q = Order.query
+
+    # Role filtering - clients: only their orders
+    if user.role == "client":
+        q = q.filter_by(client_id=user.id)
+
+    # If writer is fetching ONLY their assigned orders
+    if assigned_to == "me":
+        q = q.filter(Order.writer_id == user.id)
+
+        if status:
+            if status == "in-progress":
+                q = q.filter(Order.status.in_([
+                    "in_progress",
+                    "submitted_for_review",
+                    "revision_requested"
+                ]))
+            elif status == "in-progress-only":
+                q = q.filter(Order.status == "in_progress")
+            elif status == "in-review":
+                q = q.filter(Order.status == "submitted_for_review")
+            elif status == "in-revision":
+                q = q.filter(Order.status == "revision_requested")
+            elif status == "completed":
+                q = q.filter(Order.status == "completed")
+            elif status == "cancelled":
+                q = q.filter(Order.status == "cancelled")
+
+    # Otherwise -> writer browsing marketplace
+    else:
+        # Exclude orders they've declined
+        declined_ids = db.session.query(DeclinedOrder.order_id).filter_by(writer_id=user.id)
+        if status == "declined":
+            q = q.filter(Order.id.in_(declined_ids))
+        else:
+            q = q.filter(~Order.id.in_(declined_ids))
+
+        # Exclude orders with accepted bids (assigned orders)
+        accepted_bid_order_ids = db.session.query(Bid.order_id).filter(Bid.status == "accepted")
+        if user.role != "client":
+            q = q.filter(~Order.id.in_(accepted_bid_order_ids))
+
+        # Handle invited orders
+        if status == "invited":
+            invited_ids = db.session.query(OrderInvitation.order_id).filter_by(writer_id=user.id)
+            q = q.filter(Order.id.in_(invited_ids))
+
+        # Regular status filter
+        if status and status not in ["invited", "declined"]:
+            q = q.filter_by(status=status)
+
+    # Search filter
+    if search:
+        search_term = f"%{search}%"
+        q = q.filter(
+            or_(
+                cast(Order.id, String).ilike(search_term),
+                Order.title.ilike(search_term),
+                Order.subject.ilike(search_term),
+                Order.details.ilike(search_term),
+                Order.status.ilike(search_term)
+            )
+        )
+
+    # Budget/date filters
+    if min_budget is not None:
+        q = q.filter(Order.budget >= min_budget)
+    if max_budget is not None:
+        q = q.filter(Order.budget <= max_budget)
+    if date_from:
+        try:
+            d_from = parser.parse(date_from)
+            q = q.filter(Order.created_at >= d_from)
+        except:
+            pass
+    if date_to:
+        try:
+            d_to = parser.parse(date_to)
+            q = q.filter(Order.created_at <= d_to)
+        except:
+            pass
+
+    # Pagination & serialization
+    items, pagination = paginate_query(q.order_by(Order.created_at.desc()), page, limit)
+    orders = []
+    for o in items:
+        orders.append({
+            "id": o.id,
+            "title": o.title,
+            "subject": o.subject,
+            "type": o.type,
+            "pages": o.pages,
+            "deadline": o.deadline.isoformat() + "Z" if o.deadline else None,
+            "budget": o.budget,
+            "status": o.status,
+            "client": {
+                "id": o.client.id,
+                "name": o.client.full_name,
+                "country": o.client.country,
+                "avatar": o.client.profile_image
+            } if o.client else None,
+            "created_at": o.created_at.isoformat() + "Z" if o.created_at else None,
+            "writer_assigned": o.writer_id is not None,
+        })
+
+    return success_response({"orders": orders, "pagination": pagination})
+
+
+# ------------------------------------------------------------
+#  Helper: serialize_order(order) — returns order details + files + writer_assigned
+# ------------------------------------------------------------
+def serialize_order(order):
+    """Return order details + file URLs for API responses."""
+    data = {
+        "id": order.id,
+        "title": order.title,
+        "subject": order.subject,
+        "type": order.type,
+        "pages": order.pages,
+        "deadline": order.deadline.isoformat() if order.deadline else None,
+        "budget": order.budget,
+        "status": order.status,
+        "description": order.description,
+        "requirements": order.requirements,
+        "created_at": order.created_at.isoformat() + "Z" if order.created_at else None,
+        "client_id": order.client_id,
+        "writer_id": order.writer_id,
+        "writer_assigned": order.writer_id is not None,
+    }
+
+    data["preferred_writers"] = [
+        {
+            "id": inv.writer.id,
+            "name": inv.writer.full_name,
+            "avatar": inv.writer.profile_image
+        }
+        for inv in order.invitations
+    ]
+
+    # Attach file URLs (if any files exist)
+    root_dir = current_app.config.get("ORDERS_FOLDER", "uploads/orders")
+    order_dir = os.path.join(root_dir, str(order.client_id), order.id)
+    if os.path.exists(order_dir):
+        file_urls = [
+            current_app.url_for("orders.get_order_file", order_id=order.id, filename=f, _external=True)
+            for f in os.listdir(order_dir)
+        ]
+        data["files"] = file_urls
+    else:
+        data["files"] = []
+
+    return data
+
+
+# ------------------------------------------------------------
+#  GET /orders/<order_id> — Get single order details
+# ------------------------------------------------------------
+@bp.route("/<order_id>", methods=["GET"])
+@jwt_required()
+def get_order(order_id):
+    uid = get_jwt_identity()
+    order = Order.query.get(order_id)
+    if not order:
+        return error_response("NOT_FOUND", "Order not found", status=404)
+    return success_response(serialize_order(order))
+
+
+# ------------------------------------------------------------
+#  POST /orders — Create new order (form-data or json)
+# ------------------------------------------------------------
+@bp.route("", methods=["POST"])
+@jwt_required()
+def create_new_order():
+    uid = get_jwt_identity()
+    user = User.query.get(uid)
+    
+    if not user:
+        return error_response("NOT_FOUND", "User not found", status=404)
+
+    # Detect content type
+    if request.content_type and request.content_type.startswith("multipart/form-data"):
+        form_data = request.form.to_dict()
+        files = request.files
+    else:
+        form_data = request.get_json(silent=True) or {}
+        files = None
+
+    required = ["title", "category", "orderType", "deadline", "budget"]
+    missing = [r for r in required if not form_data.get(r)]
+    if missing:
+        return error_response("VALIDATION_ERROR", "Missing fields", {"fields": missing}, status=422)
+
+    # --- Extract fields ---
+    title = form_data.get("title")
+    category = form_data.get("category")
+    order_type = form_data.get("orderType")
+    pages = int(form_data.get("pages") or 1)
+    deadline = form_data.get("deadline")
+    budget = float(form_data.get("budget", 0))
+
+    # --- Calculate minimum allowed budget ---
+    min_budget = calculate_minimum_price(
+        category=category,
+        order_type=order_type,
+        pages=pages,
+        deadline = parser.parse(deadline).astimezone(timezone.utc),
+        now=datetime.utcnow()
+    )
+
+    if budget < min_budget:
+        return error_response("BUDGET ERROR", f"Budget too low. Minimum allowed is {min_budget}", status=400)
+
+    deadline_str = form_data.get("deadline")
+    if deadline_str:
+        try:
+            # Accept many ISO variants
+            form_data["deadline"] = parser.parse(deadline_str)
+        except Exception as e:
+            print(f"[DEADLINE_PARSE_ERROR] {e} for {deadline_str}")
+            form_data["deadline"] = None
+    else:
+        form_data["deadline"] = None
+
+    try:
+        pages = int(form_data.get("pages", 1))
+    except ValueError:
+        pages = 1
+
+    try:
+        budget = float(form_data.get("budget", 0))
+    except ValueError:
+        budget = 0.0
+
+    print(f"deadline before create_order = {form_data.get('deadline')} ({type(form_data.get('deadline'))})")
+
+    try:
+        # collect preferred writers if provided
+        preferred_writers = []
+        for key, value in form_data.items():
+            if key.startswith("preferred_writers[") and value and value.strip():
+                preferred_writers.append(value.strip())
+
+        form_data["min_budget"] = min_budget
+        # create order via service
+        if files:
+            order = create_order(user, form_data, files)
+        else:
+            order = create_order(user, form_data)
+
+        # --- Handle preferred writer invitations ---
+        if preferred_writers:
+            invited = []
+            for w in preferred_writers:
+                writer = User.query.filter(
+                    (User.id == w) | (User.full_name.ilike(f"%{w}%"))
+                ).first()
+                if writer and writer.role == "writer":
+                    inv = OrderInvitation(order_id=order.id, writer_id=writer.id)
+                    db.session.add(inv)
+                    invited.append(writer.full_name)
+            db.session.commit()
+            print(f"[ORDER_INVITE] Invited writers: {invited}")
+
+        return success_response({
+            "id": order.id,
+            "title": order.title,
+            "status": order.status,
+            "created_at": order.created_at.isoformat() + "Z"
+        }, status=200)
+    except Exception as e:
+        db.session.rollback()
+        print(f"[ORDER_CREATE_ERROR] {str(e)}")
+        return error_response("ORDER_CREATE_ERROR", str(e), status=400)
+
+
+# ------------------------------------------------------------
+#  PATCH /orders/<order_id> — Update order (NOT allowed once assigned)
+# ------------------------------------------------------------
+@bp.route("/<order_id>", methods=["PATCH"])
+@jwt_required()
+def patch_order(order_id):
+    uid = get_jwt_identity()
+    order = Order.query.get(order_id)
+
+    if not order:
+        return error_response("NOT_FOUND", "Order not found", status=404)
+
+    # Prevent editing assigned orders — enforce on backend
+    if order.writer_id is not None:
+        return error_response(
+            "FORBIDDEN",
+            "This order has already been assigned to a writer and cannot be edited.",
+            status=403
+        )
+
+    # Capture original state for diffing
+    original = {
+        "title": order.title,
+        "description": order.description,
+        "requirements": order.requirements,
+        "subject": order.subject,
+        "type": order.type,
+        "pages": order.pages,
+        "budget": order.budget,
+        "deadline": order.deadline,
+        "format": getattr(order, "format", None),
+        "citation_style": getattr(order, "citation_style", None),
+        "language": getattr(order, "language", None),
+        "additional_notes": getattr(order, "additional_notes", None),
+    }
+
+    # Detect if FormData
+    if request.content_type and request.content_type.startswith("multipart/form-data"):
+        data = request.form.to_dict()
+        files = request.files.getlist("attachedFiles")
+    else:
+        data = request.get_json(silent=True) or {}
+        files = []
+
+    # --- Extract existingFiles from frontend ---
+    existing_files = request.form.getlist("existingFiles") if request.form else []
+    existing_filenames = [os.path.basename(f) for f in existing_files]
+
+    # Map frontend → backend fields and allowed updates
+    field_map = {
+        "category": "subject",
+        "orderType": "type",
+        "detailedRequirements": "requirements",
+        "additionalNotes": "additional_notes"
+    }
+    normalized = {field_map.get(k, k): v for k, v in data.items()}
+
+    allowed = {
+        "title", "description", "requirements", "subject", "type", "pages", "budget",
+        "deadline", "status", "progress", "format", "citation_style", "language", "additional_notes"
+    }
+    updates = {k: v for k, v in normalized.items() if k in allowed}
+
+    # Convert numeric fields safely
+    if "pages" in updates:
+        try:
+            updates["pages"] = int(updates["pages"])
+        except (ValueError, TypeError):
+            updates["pages"] = 1
+
+    if "budget" in updates:
+        try:
+            updates["budget"] = float(updates["budget"])
+        except (ValueError, TypeError):
+            updates["budget"] = 0.0
+
+    if "progress" in updates:
+        try:
+            updates["progress"] = int(updates["progress"])
+        except (ValueError, TypeError):
+            updates["progress"] = 0
+
+    # Parse deadline if present
+    if "deadline" in updates and updates["deadline"]:
+        try:
+            updates["deadline"] = parser.parse(updates["deadline"])
+        except Exception:
+            updates["deadline"] = None
+
+    # Apply updates to model
+    for k, v in updates.items():
+        setattr(order, k, v)
+
+    # --- Handle file uploads & removals ---
+    root_dir = current_app.config.get("ORDERS_FOLDER", "uploads/orders")
+    order_dir = os.path.join(root_dir, str(order.client_id), str(order.id))
+    os.makedirs(order_dir, exist_ok=True)
+
+    # remove files not in existing_files
+    current_files = os.listdir(order_dir) if os.path.exists(order_dir) else []
+    for fname in current_files:
+        if fname not in existing_filenames:
+            try:
+                os.remove(os.path.join(order_dir, fname))
+            except FileNotFoundError:
+                pass
+
+    # Save newly uploaded files
+    uploaded_files = []
+    for file in files:
+        if file and getattr(file, "filename", None):
+            fname, fpath = save_uploaded_file(file, order_dir)
+            uploaded_files.append(fname)
+
+    all_files = os.listdir(order_dir) if os.path.exists(order_dir) else []
+    file_list_text = "\n".join(all_files)
+    existing_text = (order.requirements or "").split("\n\n[Attachments:")[0]
+    order.requirements = f"{existing_text}\n\n[Attachments: {len(all_files)} file(s)]\n{file_list_text}"
+
+    # --- Handle tags ---
+    tags = [v for k, v in data.items() if k.startswith("tags[") and v and v.strip()]
+    if tags:
+        from app.models.order_tag import OrderTag
+        OrderTag.query.filter_by(order_id=order.id).delete()
+        for tag in tags:
+            db.session.add(OrderTag(order_id=order.id, name=tag))
+
+    # --- Handle preferred writers ---
+    preferred_writers = [v for k, v in data.items() if k.startswith("preferred_writers[") and v and v.strip()]
+    if preferred_writers:
+        existing_invites = {inv.writer_id for inv in order.invitations}
+        for w in preferred_writers:
+            writer = User.query.filter((User.id == w) | (User.full_name.ilike(f"%{w}%"))).first()
+            if writer and writer.role == "writer" and writer.id not in existing_invites:
+                db.session.add(OrderInvitation(order_id=order.id, writer_id=writer.id))
+
+    db.session.commit()
+
+    # Determine changed fields for notification
+    real_changes = {}
+    for field, new_value in updates.items():
+        old_value = original.get(field)
+        if field == "deadline":
+            if old_value != new_value:
+                real_changes[field] = new_value
+        else:
+            if str(old_value) != str(new_value):
+                real_changes[field] = new_value
+    changed_fields = ", ".join(real_changes.keys()) if real_changes else None
+
+    # -------------------------------------------------------------------
+    # SEND NOTIFICATION TO WRITER (if order already had an accepted bid)
+    # uses accepted_bid.user_id or accepted_bid.user relationship
+    # -------------------------------------------------------------------
+    accepted_bid = Bid.query.filter_by(order_id=order.id, status="accepted").first()
+    if accepted_bid:
+        writer = User.query.get(accepted_bid.user_id)
+        if writer:
+            send_notification_to_user(
+                email=writer.email,
+                title="Order Updated",
+                message=f"The client has updated the order ({order.id}). Updated fields: {changed_fields}.",
+                notif_type="order_update",
+                details={
+                    "order_id": order.id,
+                    "updated_fields": list(updates.keys()),
+                },
+                sender_id=order.client_id,
+            )
+
+    # --- Serialize response for frontend ---
+    def _serialize_order(order):
+        root_dir = current_app.config.get("ORDERS_FOLDER", "uploads/orders")
+        order_dir = os.path.join(root_dir, str(order.client_id), order.id)
+        file_urls = []
+        if os.path.exists(order_dir):
+            file_urls = [
+                current_app.url_for("orders.get_order_file", order_id=order.id, filename=f, _external=True)
+                for f in os.listdir(order_dir)
+            ]
+
+        return {
+            "id": order.id,
+            "title": order.title,
+            "description": order.description,
+            "detailedRequirements": order.requirements,
+            "category": order.subject,
+            "orderType": order.type,
+            "pages": order.pages,
+            "format": getattr(order, "format", ""),
+            "citationStyle": getattr(order, "citation_style", ""),
+            "language": getattr(order, "language", "en-us"),
+            "budget": order.budget,
+            "deadline": order.deadline.isoformat() if order.deadline else None,
+            "additionalNotes": getattr(order, "additional_notes", ""),
+            "tags": tags or [t.name for t in getattr(order, "tags", [])],
+            "preferredWriters": [
+                {"id": inv.writer.id, "name": inv.writer.full_name}
+                for inv in order.invitations
+            ],
+            "attachments": file_urls,
+            "status": order.status,
+            "progress": order.progress,
+            "createdAt": order.created_at.isoformat() + "Z",
+            "updatedAt": order.updated_at.isoformat() + "Z" if order.updated_at else None,
+        }
+
+    return success_response({
+        "order": _serialize_order(order),
+        "message": "Order updated successfully"
+    })
+
+
+# ------------------------------------------------------------
+#  POST /orders/<order_id>/decline — Writer declines order (record)
+# ------------------------------------------------------------
+@bp.route("/<order_id>/decline", methods=["POST"])
+@jwt_required()
+def decline_order(order_id):
+    uid = get_jwt_identity()
+    user = User.query.get(uid)
+    order = Order.query.get(order_id)
+
+    if not order:
+        return error_response("NOT_FOUND", "Order not found", status=404)
+    if user.role == "client":
+        return error_response("FORBIDDEN", "Clients cannot decline orders", status=403)
+
+    from app.models.declined_order import DeclinedOrder
+    existing = DeclinedOrder.query.filter_by(order_id=order.id, writer_id=user.id).first()
+    if existing:
+        return error_response("ALREADY_DECLINED", "You have already declined this order", status=400)
+
+    try:
+        data = request.get_json(silent=True) or {}
+    except:
+        data = {}
+
+    reason = data.get("reason", "")
+
+    declined = DeclinedOrder(order_id=order.id, writer_id=user.id, reason=reason)
+    db.session.add(declined)
+    db.session.commit()
+
+    return success_response({
+        "message": "Order declined successfully",
+        "order_id": order.id,
+        "status": "declined"
+    })
+
+
+# ------------------------------------------------------------
+#  GET /orders/files/<order_id>/<filename> — Download attached file
+# ------------------------------------------------------------
+@bp.route("/files/<order_id>/<filename>", methods=["GET"])
+@jwt_required()
+def get_order_file(order_id, filename):
+    uid = get_jwt_identity()
+    user = User.query.get(uid)
+    order = Order.query.get(order_id)
+
+    if not order:
+        return error_response("NOT_FOUND", "Order not found", status=404)
+
+    root_dir = current_app.config.get("ORDERS_FOLDER", "uploads/orders")
+    file_path = os.path.join(root_dir, str(order.client_id), order.id, filename)
+
+    if not os.path.exists(file_path):
+        return error_response("NOT_FOUND", "File not found", status=404)
+
+    return send_file(file_path, as_attachment=True)
+
+
+# ------------------------------------------------------------
+#  POST /orders/<order_id>/cancel — Cancel an order (client only)
+#  - If a writer is assigned, client must provide a reason
+#  - Notify writer when assigned order is cancelled
+# ------------------------------------------------------------
+@bp.route("/<order_id>/cancel", methods=["POST"])
+@jwt_required()
+def cancel_order(order_id):
+    uid = get_jwt_identity()
+    user = User.query.get(uid)
+    order = Order.query.get(order_id)
+
+    if not order:
+        return error_response("NOT_FOUND", "Order not found", status=404)
+
+    if user.role != "client" or order.client_id != user.id:
+        return error_response("FORBIDDEN", "Only the client who created the order can cancel it", status=403)
+
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+
+    # If a writer is assigned → reason required
+    if order.writer_id and not reason:
+        return error_response(
+            "REASON_REQUIRED",
+            "A cancellation reason is required because a writer has already been assigned.",
+            status=400
+        )
+
+    reason = reason or "Cancelled by client"
+
+    order.status = "cancelled"
+    order.updated_at = datetime.utcnow()
+    db.session.commit()
+
+    # Notify writer if assigned
+    if order.writer_id:
+        writer = User.query.get(order.writer_id)
+        if writer:
+            send_notification_to_user(
+                email=writer.email,
+                title="Order Cancelled",
+                message=f"The client has cancelled order {order.id}. Reason: {reason}",
+                notif_type="order_cancelled",
+                details={
+                    "order_id": order.id,
+                    "reason": reason
+                },
+                sender_id=order.client_id,
+            )
+
+    return success_response({
+        "orderId": order.id,
+        "status": order.status,
+        "message": "Order cancelled successfully",
+        "cancelReason": reason,
+        "updatedAt": order.updated_at.isoformat() + "Z"
+    })
+
+
+# ------------------------------------------------------------
+#  POST /orders/pricing/preview — Pricing preview helper
+# ------------------------------------------------------------
+@bp.route("/pricing/preview", methods=["POST"])
+@jwt_required(optional=True)
+def preview_pricing():
+    data = request.json or {}
+    category = data.get("category")
+    order_type = data.get("orderType")
+    pages = data.get("pages")
+    # Ensure we handle missing/invalid deadline gracefully
+    try:
+        deadline = datetime.fromisoformat(data["deadline"]).replace(tzinfo=timezone.utc)
+    except Exception:
+        deadline = None
+
+    min_budget = calculate_minimum_price(
+        category,
+        order_type,
+        pages,
+        deadline,
+        datetime.now(timezone.utc)
+    )
+
+    return success_response({"min_budget": min_budget})
