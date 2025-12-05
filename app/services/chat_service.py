@@ -115,11 +115,17 @@ def sanitize_message(content: str) -> str:
 # ---------------------------------------
 
 def get_or_create_chat(order_id, client_id, writer_id):
-    chat = Chat.query.filter_by(order_id=order_id, client_id=client_id, writer_id=writer_id).first()
+    chat = Chat.query.filter_by(
+        order_id=order_id, 
+        client_id=client_id, 
+        writer_id=writer_id
+    ).first()
+
     if not chat:
         chat = Chat(order_id=order_id, client_id=client_id, writer_id=writer_id)
         db.session.add(chat)
         db.session.commit()
+
     return chat
 
 

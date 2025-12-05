@@ -12,6 +12,7 @@ from app.utils.response_formatter import success_response, error_response
 from app.models.chat import Chat
 from app.models.message import Message
 from app.extensions import db
+from app.models.user import User
 
 bp = Blueprint("chat", __name__, url_prefix="/api/v1/chats")
 
@@ -23,19 +24,60 @@ bp = Blueprint("chat", __name__, url_prefix="/api/v1/chats")
 @jwt_required()
 def create_or_get_chat():
     data = request.get_json() or {}
+
     order_id = data.get("order_id")
     writer_id = data.get("writer_id")
+    client_id = data.get("client_id")
 
-    if not order_id or not writer_id:
+    print(f"order = {order_id} client = {client_id} writer = {writer_id}")
+    uid = get_jwt_identity()
+
+    if not order_id:
+        return error_response("VALIDATION_ERROR", "order_id is required", 422)
+
+    # ----------------------------------
+    # Determine role of caller
+    # ----------------------------------
+    user = User.query.get(uid)
+
+    if user.role.lower() == "client":
+        # Client is starting the chat
+        # They MUST be the client
+        client_id = uid  
+
+        if not writer_id:
+            return error_response(
+                "VALIDATION_ERROR",
+                "writer_id is required when client starts chat",
+                422
+            )
+
+    elif user.role.lower() == "writer":
+        # Writer is starting the chat
+        writer_id = uid   # enforce writer = caller
+
+        if not client_id:
+            return error_response(
+                "VALIDATION_ERROR",
+                "client_id is required when writer starts chat",
+                422
+            )
+    else:
         return error_response(
-            "VALIDATION_ERROR",
-            "order_id and writer_id are required",
-            status=422
+            "UNAUTHORIZED",
+            "We could not sufficiently identify you",
+            403
         )
 
-    uid = get_jwt_identity()
-    client_id = data.get("client_id") or uid
+    # Final validation
+    if not writer_id or not client_id:
+        return error_response(
+            "VALIDATION_ERROR",
+            "writer_id and client_id are required",
+            422
+        )
 
+    # Create or fetch existing chat
     chat = get_or_create_chat(order_id, client_id, writer_id)
 
     return success_response({
