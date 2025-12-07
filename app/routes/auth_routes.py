@@ -18,7 +18,7 @@ def register():
     country = data.get("country")
     phone = data.get("phone")
 
-    if not role in ("client", "writer"):
+    if not role in ("client", "pending_writer"):
         return error_response("VALIDATION_ERROR", f"Could not register {role}", status=403)
 
     if not all([full_name, email, password]):
@@ -40,7 +40,6 @@ def register():
             "refresh_token": refresh
         }, status=200)
     except Exception as e:
-        print(f"error = {str(e)}")
         return error_response("USER_REGISTER_ERROR", str(e), status=400)
 
 

@@ -25,14 +25,14 @@ def apply_writer():
 
     try:
         form_data = request.form.to_dict()
-        print(f"received data = {form_data}")
+        # print(f"received data = {form_data}")
         files = request.files
 
-        print("Form keys:", list(request.form.keys()))
-        print("File keys:", list(request.files.keys()))
-        print("Files received:")
-        for key, file in request.files.items():
-            print(f"  - {key}: {file.filename} ({file.content_type}, {file.content_length} bytes)")
+        # print("Form keys:", list(request.form.keys()))
+        # print("File keys:", list(request.files.keys()))
+        # print("Files received:")
+        # for key, file in request.files.items():
+        #     print(f"  - {key}: {file.filename} ({file.content_type}, {file.content_length} bytes)")
 
         app = create_writer_application(user, form_data, files)
         return success_response({
@@ -95,7 +95,7 @@ def list_applications():
         for a in apps
     ]
 
-    print(f"data = {data}")
+    # print(f"data = {data}")
 
     return success_response(data)
 
@@ -169,7 +169,6 @@ def get_application_details(application_id):
 # ------------------------------------------
 # 3. APPROVE APPLICATION
 # ------------------------------------------
-
 @bp.route("/<string:application_id>/approve", methods=["POST"])
 @jwt_required()
 def approve_application(application_id):
@@ -182,7 +181,7 @@ def approve_application(application_id):
     if not app:
         return error_response("NOT_FOUND", "Application not found", status=404)
 
-    if app.status in ["approved", "rejected"]:
+    if app.status in ["awaiting_initial_deposit", "approved", "rejected"]:
         return error_response("INVALID_STATUS", "Application has already been processed", status=400)
 
     data = request.get_json() or {}
@@ -195,7 +194,8 @@ def approve_application(application_id):
 
         # Update user role and status
         user = app.user
-        user.application_status = "approved"
+        user.application_status = "awaiting_initial_deposit"
+        user.account_status = "awaiting_initial_deposit"
         user.role = "writer"
 
         db.session.commit()
@@ -218,7 +218,6 @@ def approve_application(application_id):
 # ------------------------------------------
 # 4. REJECT APPLICATION
 # ------------------------------------------
-
 @bp.route("/<string:application_id>/reject", methods=["POST"])
 @jwt_required()
 def reject_application(application_id):
@@ -231,7 +230,7 @@ def reject_application(application_id):
     if not app:
         return error_response("NOT_FOUND", "Application not found", status=404)
 
-    if app.status in ["approved", "rejected"]:
+    if app.status in ["awaiting_initial_deposit", "approved", "rejected"]:
         return error_response("INVALID_STATUS", "Application has already been processed", status=400)
 
     data = request.get_json() or {}
@@ -246,6 +245,7 @@ def reject_application(application_id):
 
         user = app.user
         user.application_status = "rejected"
+        user.account_status = "rejected"
 
         db.session.commit()
 
@@ -285,7 +285,7 @@ def serve_file(filename):
             return error_response("UNAUTHORIZED", "Invalid or expired token", status=401)
 
     user = User.query.get(uid)
-    print(f"user_id = {uid} user = {user}")
+    # print(f"user_id = {uid} user = {user}")
 
     if not user:
         return error_response("FORBIDDEN", "User not found or unauthorized", status=403)
@@ -301,12 +301,12 @@ def serve_file(filename):
         if not safe_path.startswith(os.path.abspath(upload_folder)):
             return error_response("FORBIDDEN", "Invalid file path", status=403)
 
-        print("========== FILE DEBUG ==========")
-        print(f"UPLOAD_FOLDER: {upload_folder}")
-        print(f"Requested filename: {filename}")
-        print(f"Resolved safe_path: {safe_path}")
-        print(f"File exists: {os.path.exists(safe_path)}")
-        print("================================")
+        # print("========== FILE DEBUG ==========")
+        # print(f"UPLOAD_FOLDER: {upload_folder}")
+        # print(f"Requested filename: {filename}")
+        # print(f"Resolved safe_path: {safe_path}")
+        # print(f"File exists: {os.path.exists(safe_path)}")
+        # print("================================")
 
         if not os.path.exists(safe_path):
             return error_response("NOT_FOUND", "File not found", status=404)
@@ -327,5 +327,5 @@ def serve_file(filename):
         return send_file(safe_path, mimetype=mimetype, as_attachment=False)
 
     except Exception as e:
-        print(f"File serving error: {e}")
+        # print(f"File serving error: {e}")
         return error_response("FILE_ERROR", str(e), status=500)

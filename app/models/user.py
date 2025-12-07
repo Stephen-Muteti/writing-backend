@@ -13,7 +13,7 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
     full_name = db.Column(db.String(255))
-    role = db.Column(db.String(50), default="writer")
+    role = db.Column(db.String(50), nullable=False)
     profile_image = db.Column(db.String(1024), nullable=True)
     rating = db.Column(db.Float, default=0.0)
     completed_orders = db.Column(db.Integer, default=0)
@@ -23,6 +23,7 @@ class User(db.Model):
     application_status = db.Column(db.String(50), default="not_applied")
     is_verified = db.Column(db.Boolean, default=False)
     country = db.Column(db.String(100), nullable=True)
+    account_status = db.Column(db.String(50), default="awaiting_initial_deposit")
 
     def to_dict(self):
         return {
@@ -35,6 +36,6 @@ class User(db.Model):
             "completed_orders": self.completed_orders,
             "bio": self.bio,
             "total_earned": self.total_earned,
-            "country": self.country,  # ➕ return it here as well
+            "country": self.country,
             "joined_at": self.joined_at.isoformat() + "Z" if self.joined_at else None
         }
